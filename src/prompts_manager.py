@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import math
 
 import pandas as pd
 from langchain_core.language_models import BaseChatModel
@@ -11,19 +10,12 @@ from langchain_core.language_models import BaseChatModel
 from src.prompt_chains import (
     finding_explanation_chain,
     report_summary_chain,
-    validation_plan_chain,
 )
 from src.prompt_schemas import (
     FindingExplanation,
-    QualityCheckPlan,
     QualityReportSummary,
 )
-from src.quality_engine import (
-    SUPPORTED_CHECKS,
-    QualityCheck,
-    QualityFinding,
-    QualityReport,
-)
+from src.quality_engine import QualityFinding, QualityReport
 
 MAX_EVIDENCE_ISSUES = 5
 IDENTITY_FIELDS = ("product_id", "product_name")
@@ -66,134 +58,6 @@ def _is_blank_or_missing(value: object) -> bool:
 
 class PromptsManager:
     """Build bounded prompt inputs and invoke versioned structured chains."""
-
-    @staticmethod
-    def propose_quality_checks(
-        llm: BaseChatModel, data: pd.DataFrame
-    ) -> QualityCheckPlan:
-        """Ask the model to select supported checks using aggregate column metadata."""
-        column_profile: list[dict[str, object]] = []
-        for column in data.columns:
-            values = data[column]
-            non_missing = values.dropna()
-            numeric = pd.to_numeric(
-                non_missing.astype("string").str.replace(",", "", regex=False),
-                errors="coerce",
-            )
-            numeric_values = numeric.dropna()
-            profile: dict[str, object] = {
-                "name": str(column),
-                "dtype": str(values.dtype),
-                "row_count": len(data),
-                "non_missing_count": int(values.notna().sum()),
-                "distinct_non_missing_count": int(non_missing.nunique()),
-                "numeric_parseable_count": len(numeric_values),
-            }
-            finite_values = [
-                float(value)
-                for value in numeric_values
-                if math.isfinite(float(value))
-            ]
-            if finite_values:
-                profile["numeric_minimum"] = min(finite_values)
-                profile["numeric_maximum"] = max(finite_values)
-            column_profile.append(profile)
-
-        catalog = [
-            {"rule_id": rule_id, "description": description}
-            for rule_id, description in SUPPORTED_CHECKS.items()
-        ]
-        return validation_plan_chain(llm).invoke(
-            {
-                "dataset_profile_json": json.dumps(
-                    {"row_count": len(data), "columns": column_profile},
-                    ensure_ascii=False,
-                    allow_nan=False,
-                ),
-                "check_catalog_json": json.dumps(catalog, ensure_ascii=False),
-            }
-        )
-
-    @staticmethod
-    def fallback_quality_checks(data: pd.DataFrame) -> QualityCheckPlan:
-        """Create a small local-only plan when the model output is unusable."""
-        columns = [str(column) for column in data.columns]
-        checks = []
-        if columns:
-            checks.append(
-                {
-                    "rule_id": "missing_values",
-                    "label": "Missing or blank values",
-                    "columns": columns,
-                    "rationale": (
-                        "Local fallback: check all columns for missing or blank "
-                        "cells; this conservative check is independent of column meaning."
-                    ),
-                }
-            )
-            checks.append(
-                {
-                    "rule_id": "exact_duplicates",
-                    "label": "Exact duplicate rows",
-                    "columns": columns,
-                    "rationale": (
-                        "Local fallback: identify rows identical across all columns; "
-                        "no rows will be removed."
-                    ),
-                }
-            )
-
-        return QualityCheckPlan.model_validate(
-            {
-                "summary": (
-                    "The model response could not be used. These conservative "
-                    "checks were created locally and still require your approval."
-                ),
-                "checks": checks,
-            }
-        )
-
-    @staticmethod
-    def validate_quality_plan(
-        plan: QualityCheckPlan, data: pd.DataFrame
-    ) -> tuple[QualityCheck, ...]:
-        """Validate model-selected columns and translate proposals to engine checks."""
-        available_columns = set(map(str, data.columns))
-        checks: list[QualityCheck] = []
-        seen: set[tuple[str, tuple[str, ...]]] = set()
-        seen_labels: set[str] = set()
-        for proposal in plan.checks:
-            unknown_columns = set(proposal.columns).difference(available_columns)
-            if unknown_columns:
-                raise ValueError(
-                    "The proposed plan referenced columns not in this dataset: "
-                    f"{', '.join(sorted(unknown_columns))}"
-                )
-            signature = (proposal.rule_id, tuple(proposal.columns))
-            if signature in seen:
-                raise ValueError(
-                    f"The proposed plan contains a duplicate check for "
-                    f"{', '.join(proposal.columns)}."
-                )
-            seen.add(signature)
-            normalized_label = proposal.label.casefold()
-            if normalized_label in seen_labels:
-                raise ValueError(
-                    f"The proposed plan contains duplicate check labels: "
-                    f"{proposal.label!r}"
-                )
-            seen_labels.add(normalized_label)
-            checks.append(
-                QualityCheck(
-                    rule_id=proposal.rule_id,
-                    label=proposal.label,
-                    columns=tuple(proposal.columns),
-                    rationale=proposal.rationale,
-                    minimum=proposal.minimum,
-                    maximum=proposal.maximum,
-                )
-            )
-        return tuple(checks)
 
     @staticmethod
     def explain_finding(

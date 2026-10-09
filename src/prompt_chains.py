@@ -6,31 +6,13 @@ from langchain_core.runnables import Runnable
 
 from src.prompt_schemas import (
     FindingExplanation,
-    QualityCheckPlan,
     QualityReportSummary,
 )
 from src.prompt_templates import (
     PROMPT_VERSION,
-    dataset_quality_checks_prompt,
     finding_explanation_prompt,
     report_summary_prompt,
 )
-
-
-def validation_plan_chain(
-    llm: BaseChatModel,
-) -> Runnable[dict[str, str], QualityCheckPlan]:
-    """Build a chain that proposes checks for a newly selected/uploaded dataset."""
-    parser = PydanticOutputParser(pydantic_object=QualityCheckPlan)
-    prompt = dataset_quality_checks_prompt(parser.get_format_instructions())
-    json_model = llm.bind(
-        response_format={"type": "json_object"},
-        max_tokens=1200,
-        extra_body={"reasoning": {"effort": "minimal"}},
-    )
-    return (prompt | json_model | parser).with_config(
-        {"run_name": f"dataset-quality-checks-v{PROMPT_VERSION}"}
-    )
 
 
 def finding_explanation_chain(

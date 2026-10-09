@@ -1,14 +1,11 @@
 from pathlib import Path
-from typing import Literal, NoReturn
+from typing import Literal
 
 import pandas as pd
-from openai import LengthFinishReasonError
-from openai.types.chat import ChatCompletion
 from streamlit.testing.v1 import AppTest
 
 import src.llm as llm_module
-from src.prompt_schemas import QualityCheckPlan, QualityCheckProposal
-from src.prompts_manager import FindingExplanation, PromptsManager
+from src.prompts_manager import FindingExplanation
 from src.quality_engine import QualityCheck, analyze_dataset
 
 
@@ -39,16 +36,6 @@ def _seed_approved_report(
     app: AppTest, data: pd.DataFrame, checks: tuple[QualityCheck, ...]
 ) -> None:
     app.session_state["quality_report"] = analyze_dataset(data, checks)
-    app.session_state["approved_quality_checks"] = checks
-
-
-def _plan_stub(plan: QualityCheckPlan):
-    def propose(llm, data):
-        assert llm is not None
-        assert isinstance(data, pd.DataFrame)
-        return plan
-
-    return propose
 
 
 def _click_key(app: AppTest, widget_type: str, key: str) -> None:
@@ -56,117 +43,34 @@ def _click_key(app: AppTest, widget_type: str, key: str) -> None:
     widget.click().run(timeout=30)
 
 
-def test_dataset_picker_shows_available_csv_and_upload_option():
+def test_app_uses_only_the_bundled_amazon_dataset():
     app = AppTest.from_file(str(APP_PATH)).run(timeout=30)
 
     assert not app.exception
-    assert "Upload a CSV…" in app.get("selectbox")[0].options
-    assert any(Path(option).name == "amazon.csv" for option in app.get("selectbox")[0].options)
-    assert any("amazon.csv" in text.value for text in app.caption)
+    assert not app.get("selectbox")
+    assert not app.get("file_uploader")
+    assert not any(button.label == "Generate AI check plan" for button in app.button)
+    assert any("amazon.csv" in caption.value for caption in app.caption)
 
 
-def test_upload_mode_displays_csv_uploader():
-    app = AppTest.from_file(str(APP_PATH)).run(timeout=30)
-    app.get("selectbox")[0].set_value("Upload a CSV…").run(timeout=30)
-
-    assert not app.exception
-    assert len(app.get("file_uploader")) == 1
-
-
-def test_ai_proposed_plan_requires_explicit_human_approval(monkeypatch):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
-    plan = QualityCheckPlan(
-        summary="Check missing ratings.",
-        checks=[
-            QualityCheckProposal(
-                rule_id="missing_values",
-                label="Missing ratings",
-                columns=["rating"],
-                rationale="The rating column may be incomplete.",
-            )
-        ],
-    )
-    monkeypatch.setattr(
-        PromptsManager,
-        "propose_quality_checks",
-        staticmethod(_plan_stub(plan)),
-    )
+def test_quality_engine_runs_directly_without_an_ai_check_plan():
     app = AppTest.from_file(str(APP_PATH)).run(timeout=30)
 
-    _click_key(app, "button", "generate_quality_plan")
-    assert app.checkbox[0].value is False
-    assert "quality_report" not in app.session_state
-
-    app.checkbox[0].set_value(True).run(timeout=30)
-    _click_key(app, "button", "approve_and_run_quality_checks")
+    _click_key(app, "button", "run_quality_checks")
 
     report = app.session_state["quality_report"]
+    amazon_data = pd.read_csv(
+        Path(__file__).resolve().parents[1] / "data" / "amazon.csv"
+    )
     assert not app.exception
-    assert len(report.findings) == 1
-    assert report.findings[0].rule == "Missing ratings"
-    assert report.findings[0].columns == ("rating",)
-    assert app.session_state["approved_quality_checks"][0].columns == ("rating",)
+    assert report.summary.rows == len(amazon_data)
+    assert "quality_check_plan" not in app.session_state
+    assert "approved_quality_checks" not in app.session_state
 
 
-def test_truncated_llm_plan_uses_local_fallback_without_retry(monkeypatch):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
-    completion = ChatCompletion(
-        id="test-completion",
-        choices=[
-            {
-                "finish_reason": "length",
-                "index": 0,
-                "message": {"role": "assistant", "content": None},
-            }
-        ],
-        created=1,
-        model="test-model",
-        object="chat.completion",
-    )
-
-    def raise_length_error(*args: object) -> NoReturn:
-        assert args[0] is not None
-        assert isinstance(args[1], pd.DataFrame)
-        raise LengthFinishReasonError(completion=completion)
-
-    monkeypatch.setattr(
-        PromptsManager,
-        "propose_quality_checks",
-        staticmethod(raise_length_error),
-    )
+def test_selecting_missing_values_shows_inline_details_without_an_issue_table():
     app = AppTest.from_file(str(APP_PATH)).run(timeout=30)
-
-    _click_key(app, "button", "generate_quality_plan")
-
-    assert not app.exception
-    assert app.session_state["quality_check_plan_origin"] == "Local fallback"
-    assert len(app.session_state["quality_check_candidates"]) == 2
-    assert any("No retry was made" in message.value for message in app.warning)
-    assert "quality_report" not in app.session_state
-
-
-def test_selecting_missing_values_shows_inline_details_without_an_issue_table(monkeypatch):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
-    plan = QualityCheckPlan(
-        summary="Inspect missing rating counts.",
-        checks=[
-            QualityCheckProposal(
-                rule_id="missing_values",
-                label="Missing and blank values",
-                columns=["rating_count"],
-                rationale="This field contains missing observations.",
-            )
-        ],
-    )
-    monkeypatch.setattr(
-        PromptsManager,
-        "propose_quality_checks",
-        staticmethod(_plan_stub(plan)),
-    )
-    app = AppTest.from_file(str(APP_PATH)).run(timeout=30)
-    _click_key(app, "button", "generate_quality_plan")
-    app.checkbox[0].set_value(True).run(timeout=30)
-    _click_key(app, "button", "approve_and_run_quality_checks")
+    _click_key(app, "button", "run_quality_checks")
     app.get("segmented_control")[0].set_value("Investigate").run(timeout=30)
 
     assert not app.exception
@@ -174,8 +78,7 @@ def test_selecting_missing_values_shows_inline_details_without_an_issue_table(mo
     assert any(
         markdown.value == "#### Missing and blank values" for markdown in app.markdown
     )
-    assert any("Field:** `rating_count`" in markdown.value for markdown in app.markdown)
-    assert any("Records 1–2 of 2" in caption.value for caption in app.caption)
+    assert any("Field:**" in markdown.value for markdown in app.markdown)
     assert any(
         button.label == "Explain finding and recommend a fix" for button in app.button
     )
@@ -232,7 +135,8 @@ def test_export_is_gated_until_approved_validation_is_available():
     app.get("segmented_control")[0].set_value("Export").run(timeout=30)
     assert not app.exception
     assert any(
-        "Generate a check plan" in message.value for message in app.info
+        "Run the Amazon product quality engine" in message.value
+        for message in app.info
     )
     assert len(app.get("download_button")) == 0
 

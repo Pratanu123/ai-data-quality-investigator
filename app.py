@@ -2,19 +2,15 @@
 
 from __future__ import annotations
 
-import hashlib
-import os
-from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 from langchain_core.exceptions import OutputParserException
-from openai import APIError, LengthFinishReasonError
+from openai import APIError
 
 from src.cleaning import apply_cleaning_proposals, propose_cleaning
 from src.llm import (
-    DEFAULT_OPENROUTER_MODEL,
     OpenRouterConfigurationError,
     getllm,
     is_openrouter_configured,
@@ -25,14 +21,11 @@ from src.prompts_manager import (
     PromptsManager,
     QualityReportSummary,
 )
-from src.prompt_schemas import QualityCheckPlan
-from src.prompt_templates import PROMPT_VERSION
 from src.quality_engine import (
-    SUPPORTED_CHECKS,
-    QualityCheck,
     QualityFinding,
     QualityIssue,
     QualityReport,
+    VALIDATION_RULES,
     analyze_dataset,
     summarize_dataset,
 )
@@ -74,43 +67,11 @@ def _render_issue_card(finding: QualityFinding, issue: QualityIssue) -> None:
                 st.markdown(f"**Field:** `{field}` · {label}")
 
 
-def _reset_dataset_analysis() -> None:
-    for key in tuple(st.session_state):
-        if key.startswith(
-            (
-                "quality_ai_finding_",
-                "explain_",
-                "issue_page_",
-                "quality_plan_select_",
-            )
-        ):
-            st.session_state.pop(key, None)
-    for key in (
-        "quality_report",
-        "quality_ai_summary",
-        "quality_check_plan",
-        "quality_check_candidates",
-        "quality_check_plan_origin",
-        "quality_check_plan_notice",
-        "approved_quality_checks",
-        "cleaning_proposals",
-        "approved_cleaned_dataset",
-        "approved_cleaning_count",
-        "approved_proposal_indices",
-        "cleaning_preview_editor",
-        "selected_quality_rule",
-    ):
-        st.session_state.pop(key, None)
-
-
-def _run_quality_checks(
-    data: pd.DataFrame, checks: tuple[QualityCheck, ...]
-) -> None:
-    with st.status("Running approved checks...", expanded=True) as status:
-        report = analyze_dataset(data, checks)
+def _run_quality_checks(data: pd.DataFrame) -> None:
+    with st.status("Running Amazon product quality checks...", expanded=True) as status:
+        report = analyze_dataset(data)
         st.session_state["quality_report"] = report
-        st.session_state["approved_quality_checks"] = checks
-        st.session_state["cleaning_proposals"] = propose_cleaning(data, checks)
+        st.session_state["cleaning_proposals"] = propose_cleaning(data)
         for key in (
             "approved_cleaned_dataset",
             "approved_cleaning_count",
@@ -119,16 +80,14 @@ def _run_quality_checks(
             "quality_ai_summary",
         ):
             st.session_state.pop(key, None)
-        status.update(label="Validation complete", state="complete", expanded=False)
+        status.update(label="Quality checks complete", state="complete", expanded=False)
 
 
-def _ensure_quality_report(
-    checks: tuple[QualityCheck, ...] | None,
-) -> QualityReport | None:
+def _ensure_quality_report() -> QualityReport | None:
     report = st.session_state.get("quality_report")
-    if isinstance(report, QualityReport) and checks:
+    if isinstance(report, QualityReport):
         return report
-    st.info("Generate a check plan, approve the rules, and run them from Overview.")
+    st.info("Run the Amazon product quality engine from Overview first.")
     return None
 
 
@@ -289,7 +248,7 @@ def _render_investigation(report: QualityReport, openrouter_ready: bool) -> None
 
 
 def _render_cleaning(
-    data: pd.DataFrame, checks: tuple[QualityCheck, ...]
+    data: pd.DataFrame,
 ) -> None:
     st.subheader("Clean data")
     st.caption(
@@ -299,7 +258,7 @@ def _render_cleaning(
 
     proposals = st.session_state.get("cleaning_proposals")
     if not isinstance(proposals, tuple):
-        proposals = propose_cleaning(data, checks)
+        proposals = propose_cleaning(data)
         st.session_state["cleaning_proposals"] = proposals
 
     if not proposals:
@@ -480,47 +439,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-available_csvs = sorted(DATA_DIRECTORY.rglob("*.csv"))
-source_options: list[str] = ["Upload a CSV…", *(str(path) for path in available_csvs)]
-default_source = (
-    str(DATA_DIRECTORY / "amazon.csv")
-    if (DATA_DIRECTORY / "amazon.csv") in available_csvs
-    else source_options[1] if len(source_options) > 1 else source_options[0]
-)
-selected_source = st.selectbox(
-    "Dataset",
-    source_options,
-    index=source_options.index(default_source),
-    format_func=lambda source: (
-        "Upload a CSV…"
-        if source == "Upload a CSV…"
-        else Path(source).relative_to(DATA_DIRECTORY).as_posix()
-    ),
-    key="dataset_source",
-)
-
-uploaded_file = None
-if selected_source == "Upload a CSV…":
-    uploaded_file = st.file_uploader(
-        "Upload a dataset",
-        type=["csv"],
-        help="CSV files only. The uploaded dataset is processed in this Streamlit session.",
-        key="uploaded_dataset",
-    )
-    if uploaded_file is None:
-        st.info("Upload a CSV, or select a dataset stored in the project's data folder.")
-        st.stop()
-
+dataset_path = DATA_DIRECTORY / "amazon.csv"
 try:
-    if uploaded_file is not None:
-        csv_bytes = uploaded_file.getvalue()
-        dataset_name = Path(uploaded_file.name).name
-    else:
-        selected_path = Path(selected_source)
-        csv_bytes = selected_path.read_bytes()
-        dataset_name = selected_path.name
-    dataset_signature = hashlib.sha256(csv_bytes).hexdigest()
-    dataset = pd.read_csv(BytesIO(csv_bytes))
+    dataset = pd.read_csv(dataset_path)
 except (
     OSError,
     ValueError,
@@ -528,22 +449,15 @@ except (
     pd.errors.EmptyDataError,
     UnicodeDecodeError,
 ) as exc:
-    st.error(f"Could not load the selected CSV dataset: {exc}")
+    st.error(f"Could not load the Amazon product dataset: {exc}")
     st.stop()
 
-if st.session_state.get("dataset_signature") != dataset_signature:
-    _reset_dataset_analysis()
-    st.session_state["dataset_signature"] = dataset_signature
-
+dataset_name = dataset_path.name
 summary = summarize_dataset(dataset)
 openrouter_ready = is_openrouter_configured()
 report = st.session_state.get("quality_report")
 if not isinstance(report, QualityReport):
     report = None
-plan = st.session_state.get("quality_check_plan")
-approved_checks = st.session_state.get("approved_quality_checks")
-if not isinstance(approved_checks, tuple):
-    approved_checks = None
 
 header, status_column = st.columns([5, 1])
 with header:
@@ -596,8 +510,8 @@ metric_columns[1].metric("Exact duplicates", f"{summary.exact_duplicate_rows:,}"
 if stage == "Overview":
     st.subheader("Dataset overview")
     st.caption(
-        "Review the dataset profile, request an AI-proposed validation plan, then "
-        "approve the specific deterministic checks before they run."
+        "This workspace runs the built-in Amazon product checks on the bundled dataset. "
+        "No upload or AI-generated check plan is used."
     )
     overview, scope = st.columns([1.15, 0.85], gap="large")
     with overview:
@@ -625,169 +539,35 @@ if stage == "Overview":
             )
             st.dataframe(profile, width="stretch", hide_index=True)
 
-    st.markdown("#### Propose validation checks")
+    st.markdown("#### Built-in quality checks")
     st.caption(
-        "The planning request sends column names, inferred types, and aggregate "
-        "counts/ranges to the configured model. It does not send sample or row values. "
-        "No check runs until you select and approve it below."
+        "The local engine runs these Amazon-specific rules directly. "
+        "No LLM call is made to choose checks."
     )
-    st.caption(
-        "After approval, the quality engine runs locally and deterministically; "
-        "it does not call an LLM."
-    )
-    if not openrouter_ready:
-        st.info(
-            "Configure `OPENROUTER_API_KEY` to generate a plan. Dataset selection "
-            "and profiling are local."
-        )
+    for rule in VALIDATION_RULES:
+        st.markdown(f"- {rule}")
+
     if st.button(
-        "Generate AI check plan",
+        "Run Amazon product quality checks",
         type="primary",
-        disabled=not openrouter_ready,
-        key="generate_quality_plan",
+        key="run_quality_checks",
     ):
-        plan_notice = None
-        plan_origin = "AI-proposed"
-        try:
-            with st.spinner("Reviewing column metadata and proposing checks..."):
-                generated_plan = PromptsManager.propose_quality_checks(
-                    getllm(), dataset
-                )
-                proposed_checks = PromptsManager.validate_quality_plan(
-                    generated_plan, dataset
-                )
-        except LengthFinishReasonError:
-            generated_plan = PromptsManager.fallback_quality_checks(dataset)
-            proposed_checks = PromptsManager.validate_quality_plan(
-                generated_plan, dataset
-            )
-            plan_origin = "Local fallback"
-            plan_notice = (
-                "The model used its token budget before returning a complete plan. "
-                "No retry was made. A small local fallback plan is shown instead; "
-                "review and approve checks before they run."
-            )
-        except OutputParserException:
-            generated_plan = PromptsManager.fallback_quality_checks(dataset)
-            proposed_checks = PromptsManager.validate_quality_plan(
-                generated_plan, dataset
-            )
-            plan_origin = "Local fallback"
-            plan_notice = (
-                "The model response could not be parsed. No retry was made. "
-                "A small local fallback plan is shown instead; review and approve "
-                "checks before they run."
-            )
-        except OpenRouterConfigurationError as exc:
-            st.error(str(exc))
-            generated_plan = None
-            proposed_checks = ()
-        except (APIError, ValueError) as exc:
-            st.error(f"Could not generate the quality-check plan: {exc}")
-            generated_plan = None
-            proposed_checks = ()
-
-        if generated_plan is not None:
-            st.session_state["quality_check_plan"] = generated_plan
-            st.session_state["quality_check_candidates"] = proposed_checks
-            st.session_state["quality_check_plan_origin"] = plan_origin
-            st.session_state["quality_check_plan_notice"] = plan_notice
-            for key in tuple(st.session_state):
-                if key.startswith(
-                    ("quality_plan_select_", "quality_ai_finding_", "explain_")
-                ):
-                    st.session_state.pop(key, None)
-            for key in (
-                "quality_report",
-                "quality_ai_summary",
-                "approved_quality_checks",
-                "cleaning_proposals",
-                "approved_cleaned_dataset",
-                "approved_cleaning_count",
-                "approved_proposal_indices",
-                "cleaning_preview_editor",
-            ):
-                st.session_state.pop(key, None)
-            if plan_notice:
-                st.warning(plan_notice)
-            else:
-                st.success(
-                    f"Plan generated using prompt version {PROMPT_VERSION}. "
-                    "Review each proposed check before approving."
-                )
-
-    plan = st.session_state.get("quality_check_plan")
-    candidates = st.session_state.get("quality_check_candidates")
-    if isinstance(plan, QualityCheckPlan) and isinstance(candidates, tuple):
-        with st.container(border=True):
-            plan_origin = st.session_state.get("quality_check_plan_origin", "AI-proposed")
-            st.markdown(
-                f"#### {plan_origin} checks · Human approval required"
-            )
-            plan_notice = st.session_state.get("quality_check_plan_notice")
-            if isinstance(plan_notice, str) and plan_notice:
-                st.info(plan_notice)
-            st.text(plan.summary)
-            st.caption(
-                "Supported checks run deterministically and locally after approval."
-            )
-            if plan_origin == "AI-proposed":
-                st.caption(
-                    f"Model: `{os.getenv('OPENROUTER_MODEL', DEFAULT_OPENROUTER_MODEL)}`"
-                )
-            if not plan.checks:
-                st.info(
-                    "The model did not recommend any supported checks for these "
-                    "columns. Try another dataset or generate a new plan."
-                )
-            selected_indices: list[int] = []
-            for index, proposal in enumerate(plan.checks):
-                with st.container(border=True):
-                    selected = st.checkbox(
-                        f"Approve check {index + 1}",
-                        value=False,
-                        key=f"quality_plan_select_{index}",
-                    )
-                    if selected:
-                        selected_indices.append(index)
-                    st.text(f"{proposal.label} · {', '.join(proposal.columns)}")
-                    st.text(proposal.rationale)
-                    st.caption(SUPPORTED_CHECKS[proposal.rule_id])
-                    if proposal.rule_id == "numeric_range":
-                        st.caption(
-                            f"Proposed inclusive bounds: "
-                            f"{proposal.minimum if proposal.minimum is not None else 'no minimum'} "
-                            f"to {proposal.maximum if proposal.maximum is not None else 'no maximum'}"
-                        )
-
-            selected_checks = tuple(candidates[index] for index in selected_indices)
-            if st.button(
-                "Approve selected checks and run",
-                type="primary",
-                disabled=not selected_checks,
-                key="approve_and_run_quality_checks",
-            ):
-                try:
-                    _run_quality_checks(dataset, selected_checks)
-                    st.rerun()
-                except ValueError as exc:
-                    st.error(f"Could not run the approved checks: {exc}")
-            if plan.checks and not selected_checks:
-                st.caption("Select at least one proposed check to continue.")
+        with st.spinner("Running deterministic local quality checks..."):
+            _run_quality_checks(dataset)
 
     if report is not None:
-        st.success("Approved checks complete. Continue to Investigate or Clean data.")
+        st.success("Amazon product quality checks complete. Continue to Investigate or Clean data.")
 
 elif stage == "Investigate":
-    report = _ensure_quality_report(approved_checks)
+    report = _ensure_quality_report()
     if report is not None:
         _render_investigation(report, openrouter_ready)
 
 elif stage == "Clean data":
-    report = _ensure_quality_report(approved_checks)
+    report = _ensure_quality_report()
     if report is not None:
-        _render_cleaning(dataset, approved_checks or ())
+        _render_cleaning(dataset)
 
 elif stage == "Export":
-    report = _ensure_quality_report(approved_checks)
+    report = _ensure_quality_report()
     _render_export(report, dataset_name)

@@ -1,0 +1,9 @@
+streamlit
+pandas
+numpy
+plotly
+pytest
+python-dotenv
+pydantic
+langchain-core
+langchain-openai
